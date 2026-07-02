@@ -134,15 +134,23 @@ def analyze_board(df):
 
 
 def scan_boards(ak):
-    """题材雷达主流程：粗筛 -> 拉历史 -> 精筛 -> 打分排序"""
+    """题材雷达主流程：粗筛 -> 拉历史 -> 精筛 -> 打分排序
+    返回 (命中板块列表, 诊断统计)"""
     boards = get_all_boards(ak)
+    stats = {"total": len(boards), "checked": 0, "fetch_fail": 0,
+             "pos_low": 0, "pos_high": 0, "vol_low": 0, "hit": 0}
     if not boards:
-        return []
+        return [], stats
 
-    # 粗筛：当日涨幅靠前的先看（省流量），取前60个
-    boards.sort(key=lambda b: b["chg"], reverse=True)
-    candidates = [b for b in boards if b["chg"] > -1][:60]
-    log(f"粗筛出 {len(candidates)} 个候选板块，开始逐个分析…")
+    # 粗筛规则：
+    # - 行业板块只有80多个，全部细查（低位启动的板块当天不一定涨，不能靠当日涨幅筛）
+    # - 概念板块几百个，取当日涨幅前80的细查（概念太多只能取活跃的）
+    industries = [b for b in boards if b["type"] == "industry"]
+    concepts = [b for b in boards if b["type"] == "concept"]
+    concepts.sort(key=lambda b: b["chg"], reverse=True)
+    candidates = industries + concepts[:80]
+    stats["checked"] = len(candidates)
+    log(f"细查 {len(industries)} 个行业板块（全量）+ {min(len(concepts), 80)} 个活跃概念板块")
 
     end = datetime.now().strftime("%Y%m%d")
     start = (datetime.now() - timedelta(days=LOOKBACK_DAYS + 80)).strftime("%Y%m%d")
@@ -152,15 +160,22 @@ def scan_boards(ak):
         time.sleep(REQUEST_SLEEP)
         df = get_board_hist(ak, b["name"], b["type"], start, end)
         if df is None:
+            stats["fetch_fail"] += 1
             continue
         m = analyze_board(df)
         if m is None:
+            stats["fetch_fail"] += 1
             continue
         pos, vr = m["pos"], m["vol_ratio"]
 
-        if pos > BOARD_POS_MAX or pos < BOARD_POS_WATCH[0]:
+        if pos < BOARD_POS_WATCH[0]:
+            stats["pos_low"] += 1
+            continue
+        if pos > BOARD_POS_MAX:
+            stats["pos_high"] += 1
             continue
         if vr < BOARD_VOL_RATIO_MIN:
+            stats["vol_low"] += 1
             continue
 
         if BOARD_POS_FOCUS[0] <= pos <= BOARD_POS_FOCUS[1]:
@@ -173,9 +188,10 @@ def scan_boards(ak):
         score = tier_score + min(vr, 3) * 15 + min(m["chg5"], 0.10) * 200 + b["chg"]
         results.append({**b, **m, "tier": tier, "score": score})
 
+    stats["hit"] = len(results)
     results.sort(key=lambda x: x["score"], reverse=True)
     log(f"雷达命中 {len(results)} 个板块，取前 {TOP_BOARDS} 个")
-    return results[:TOP_BOARDS]
+    return results[:TOP_BOARDS], stats
 
 
 # ============ 第二步：个股筛选 ============
@@ -389,7 +405,7 @@ def ai_summary(report_text, news_list):
         "2. 如果某个板块在快讯里找不到相关消息，直接写'暂无消息面驱动，属于资金"
         "行为'，严禁编造不存在的新闻。\n"
         "3. 最后给一句整体建议（观察为主还是可小仓位试探），必须提示风险。\n"
-        "语气平实，不吹票。\n\n"
+        "语气平实，不吹票。直接输出内容，禁止'好的''老板''收到'之类的寒暄开场白。\n\n"
         f"【今日财经快讯】\n{news_block}\n\n"
         f"【题材雷达筛选结果】\n{report_text}"
     )
@@ -426,28 +442,37 @@ def push_feishu(text):
 
 # ============ 主流程 ============
 
-def build_report(boards_result):
+def build_report(boards_result, stats):
     today = datetime.now().strftime("%Y-%m-%d")
     lines = [f"📡 A股题材雷达分析日报 {today}", ""]
 
     if not boards_result:
         lines.append("今日雷达没有扫到符合'低位启动+放量'条件的板块。")
         lines.append("空仓休息也是一种操作，等信号出现再动手。")
-        return "\n".join(lines)
+    else:
+        for i, (board, stocks) in enumerate(boards_result, 1):
+            lines.append(f"【{i}】{board['name']}  {board['tier']}")
+            lines.append(
+                f"    距低点+{board['pos']:.0%} | 近5日{board['chg5']:+.1%} | "
+                f"量能{board['vol_ratio']:.1f}倍 | 今日{board['chg']:+.1f}%")
+            if stocks:
+                for s in stocks:
+                    lines.append(f"    ▸ {s['name']}({s['code']}) 评分{s['score']} "
+                                 f"现价{s['price']:.2f}")
+                    lines.append(f"      {'；'.join(s['reasons'][:3])}")
+            else:
+                lines.append("    （板块入选，但成分股暂无高分标的，先观察）")
+            lines.append("")
 
-    for i, (board, stocks) in enumerate(boards_result, 1):
-        lines.append(f"【{i}】{board['name']}  {board['tier']}")
-        lines.append(
-            f"    距低点+{board['pos']:.0%} | 近5日{board['chg5']:+.1%} | "
-            f"量能{board['vol_ratio']:.1f}倍 | 今日{board['chg']:+.1f}%")
-        if stocks:
-            for s in stocks:
-                lines.append(f"    ▸ {s['name']}({s['code']}) 评分{s['score']} "
-                             f"现价{s['price']:.2f}")
-                lines.append(f"      {'；'.join(s['reasons'][:3])}")
-        else:
-            lines.append("    （板块入选，但成分股暂无高分标的，先观察）")
-        lines.append("")
+    # 诊断信息：让每次运行都能自我解释，出问题好排查
+    lines.append(
+        f"📋 扫描明细：细查{stats.get('checked', 0)}个板块 | "
+        f"命中{stats.get('hit', 0)} | 还在低位没启动{stats.get('pos_low', 0)} | "
+        f"涨幅已超35%剔除{stats.get('pos_high', 0)} | "
+        f"量能不足{stats.get('vol_low', 0)} | 取数失败{stats.get('fetch_fail', 0)}")
+    if stats.get("fetch_fail", 0) > stats.get("checked", 1) * 0.3:
+        lines.append("⚠️ 今日取数失败偏多，结果可能不完整，建议明天对照观察。")
+    lines.append("")
 
     return "\n".join(lines)
 
@@ -461,14 +486,14 @@ def main():
         return
 
     try:
-        top_boards = scan_boards(ak)
+        top_boards, stats = scan_boards(ak)
         boards_result = []
         for b in top_boards:
             log(f"筛选板块成分股: {b['name']}")
             stocks = screen_board_stocks(ak, b)
             boards_result.append((b, stocks))
 
-        report = build_report(boards_result)
+        report = build_report(boards_result, stats)
 
         news = fetch_hot_news(ak)
         ai_text = ai_summary(report, news)
