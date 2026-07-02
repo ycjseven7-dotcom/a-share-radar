@@ -64,26 +64,52 @@ def calc_macd(close):
 
 # ============ 第一步：题材雷达 ============
 
-def get_all_boards(ak):
+def _pick_col(df, keyword):
+    """在表格里找包含关键字的列名（防接口改列名）"""
+    for c in df.columns:
+        if keyword in str(c):
+            return c
+    return None
+
+
+def _fetch_board_list(fn, btype, errors, retries=3):
+    """拉板块列表，失败自动重试，错误记下来给报告用"""
+    for attempt in range(1, retries + 1):
+        try:
+            df = fn()
+            if df is None or len(df) == 0:
+                raise ValueError("返回了空表")
+            name_col = _pick_col(df, "名称")
+            chg_col = _pick_col(df, "涨跌幅")
+            if name_col is None:
+                raise ValueError(f"找不到名称列，实际列名: {list(df.columns)[:8]}")
+            out = []
+            for _, r in df.iterrows():
+                chg = 0.0
+                if chg_col:
+                    try:
+                        chg = float(r.get(chg_col, 0) or 0)
+                    except Exception:
+                        chg = 0.0
+                out.append({"name": str(r[name_col]), "type": btype, "chg": chg})
+            return out
+        except Exception as e:
+            log(f"{btype}板块获取失败(第{attempt}次): {e}")
+            if attempt == retries:
+                errors.append(f"{btype}板块列表: {str(e)[:120]}")
+            else:
+                time.sleep(3 * attempt)  # 歇一会再试
+    return []
+
+
+def get_all_boards(ak, errors):
     """拿到全市场 行业板块+概念板块 的当日快照"""
-    boards = []
-    try:
-        ind = ak.stock_board_industry_name_em()
-        for _, r in ind.iterrows():
-            boards.append({"name": str(r["板块名称"]), "type": "industry",
-                           "chg": float(r.get("涨跌幅", 0) or 0)})
-        log(f"行业板块 {len(ind)} 个")
-    except Exception as e:
-        log(f"行业板块获取失败: {e}")
+    boards = _fetch_board_list(ak.stock_board_industry_name_em, "industry", errors)
+    log(f"行业板块 {len(boards)} 个")
     time.sleep(REQUEST_SLEEP)
-    try:
-        con = ak.stock_board_concept_name_em()
-        for _, r in con.iterrows():
-            boards.append({"name": str(r["板块名称"]), "type": "concept",
-                           "chg": float(r.get("涨跌幅", 0) or 0)})
-        log(f"概念板块 {len(con)} 个")
-    except Exception as e:
-        log(f"概念板块获取失败: {e}")
+    concepts = _fetch_board_list(ak.stock_board_concept_name_em, "concept", errors)
+    log(f"概念板块 {len(concepts)} 个")
+    boards += concepts
 
     # 过滤黑名单
     boards = [b for b in boards
@@ -136,9 +162,11 @@ def analyze_board(df):
 def scan_boards(ak):
     """题材雷达主流程：粗筛 -> 拉历史 -> 精筛 -> 打分排序
     返回 (命中板块列表, 诊断统计)"""
-    boards = get_all_boards(ak)
+    errors = []
+    boards = get_all_boards(ak, errors)
     stats = {"total": len(boards), "checked": 0, "fetch_fail": 0,
-             "pos_low": 0, "pos_high": 0, "vol_low": 0, "hit": 0}
+             "pos_low": 0, "pos_high": 0, "vol_low": 0, "hit": 0,
+             "errors": errors}
     if not boards:
         return [], stats
 
@@ -470,7 +498,11 @@ def build_report(boards_result, stats):
         f"命中{stats.get('hit', 0)} | 还在低位没启动{stats.get('pos_low', 0)} | "
         f"涨幅已超35%剔除{stats.get('pos_high', 0)} | "
         f"量能不足{stats.get('vol_low', 0)} | 取数失败{stats.get('fetch_fail', 0)}")
-    if stats.get("fetch_fail", 0) > stats.get("checked", 1) * 0.3:
+    if stats.get("checked", 0) == 0:
+        lines.append("🚨 板块名单一个都没拿到，今天的'没扫到'是故障导致的，不是市场真没信号！")
+        for e in stats.get("errors", [])[:3]:
+            lines.append(f"    错误详情: {e}")
+    elif stats.get("fetch_fail", 0) > stats.get("checked", 1) * 0.3:
         lines.append("⚠️ 今日取数失败偏多，结果可能不完整，建议明天对照观察。")
     lines.append("")
 
