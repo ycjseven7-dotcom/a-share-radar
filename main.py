@@ -62,6 +62,111 @@ def calc_macd(close):
     return dif, dea
 
 
+
+# ============ 东财直连数据层（多镜像轮换，akshare只做兜底） ============
+
+EM_PUSH2_HOSTS = [
+    "push2.eastmoney.com", "1.push2.eastmoney.com", "7.push2.eastmoney.com",
+    "33.push2.eastmoney.com", "56.push2.eastmoney.com", "90.push2.eastmoney.com",
+]
+EM_PUSH2HIS_HOSTS = [
+    "push2his.eastmoney.com", "7.push2his.eastmoney.com",
+    "23.push2his.eastmoney.com", "46.push2his.eastmoney.com",
+]
+EM_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/126.0.0.0 Safari/537.36"),
+    "Referer": "https://quote.eastmoney.com/",
+    "Accept": "*/*",
+}
+_session = requests.Session()
+
+
+def _em_api(hosts, path, params, tag):
+    """轮着试每台镜像服务器，谁通用谁"""
+    last_err = None
+    for host in hosts:
+        for _ in range(2):
+            try:
+                r = _session.get(f"https://{host}{path}", params=params,
+                                 headers=EM_HEADERS, timeout=15)
+                j = r.json()
+                if j.get("data"):
+                    return j["data"]
+                last_err = f"{host}: 返回空数据"
+            except Exception as e:
+                last_err = f"{host}: {str(e)[:80]}"
+            time.sleep(0.3)
+    raise ConnectionError(f"{tag}全部镜像失败, 最后错误: {last_err}")
+
+
+def get_boards_direct(btype):
+    """直连东财拿板块列表（带板块代码BKxxxx，涨跌幅）"""
+    fs = "m:90+t:2+f:!50" if btype == "industry" else "m:90+t:3+f:!50"
+    data = _em_api(EM_PUSH2_HOSTS, "/api/qt/clist/get", {
+        "pn": 1, "pz": 1000, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+        "fid": "f3", "fs": fs, "fields": "f3,f12,f14",
+    }, f"{btype}板块列表")
+    out = []
+    for d in data.get("diff", []):
+        try:
+            chg = float(d.get("f3", 0) or 0)
+        except Exception:
+            chg = 0.0
+        out.append({"name": str(d.get("f14", "")), "code": str(d.get("f12", "")),
+                    "type": btype, "chg": chg})
+    if not out:
+        raise ValueError(f"{btype}板块列表解析为空")
+    return out
+
+
+def _kline_to_df(data):
+    """把东财K线接口的返回转成和akshare同款的表格"""
+    rows = []
+    for line in data.get("klines", []):
+        p = line.split(",")
+        if len(p) >= 6:
+            rows.append({"日期": p[0], "开盘": float(p[1]), "收盘": float(p[2]),
+                         "最高": float(p[3]), "最低": float(p[4]),
+                         "成交量": float(p[5])})
+    return pd.DataFrame(rows)
+
+
+def get_kline_direct(secid, lmt=140):
+    """直连东财拿日K线。secid格式: 90.BK1027(板块) / 1.600519(沪) / 0.000001(深)"""
+    data = _em_api(EM_PUSH2HIS_HOSTS, "/api/qt/stock/kline/get", {
+        "secid": secid, "klt": 101, "fqt": 1, "lmt": lmt, "end": "20500101",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57",
+    }, f"K线{secid}")
+    df = _kline_to_df(data)
+    if len(df) < 20:
+        raise ValueError(f"K线{secid}数据太少({len(df)}条)")
+    return df
+
+
+def get_constituents_direct(bk_code, top_n):
+    """直连东财拿板块成分股，已按成交额从大到小排好"""
+    data = _em_api(EM_PUSH2_HOSTS, "/api/qt/clist/get", {
+        "pn": 1, "pz": top_n * 2, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+        "fid": "f6", "fs": f"b:{bk_code}+f:!50", "fields": "f2,f12,f14",
+    }, f"成分股{bk_code}")
+    out = []
+    for d in data.get("diff", []):
+        try:
+            price = float(d.get("f2", 0) or 0)
+        except Exception:
+            price = 0.0
+        out.append({"code": str(d.get("f12", "")).zfill(6),
+                    "name": str(d.get("f14", "")), "price": price})
+    return out
+
+
+def stock_secid(code):
+    return ("1." if code.startswith("6") else "0.") + code
+
+
 # ============ 第一步：题材雷达 ============
 
 def _pick_col(df, keyword):
@@ -102,14 +207,30 @@ def _fetch_board_list(fn, btype, errors, retries=3):
     return []
 
 
-def get_all_boards(ak, errors):
-    """拿到全市场 行业板块+概念板块 的当日快照"""
-    boards = _fetch_board_list(ak.stock_board_industry_name_em, "industry", errors)
-    log(f"行业板块 {len(boards)} 个")
-    time.sleep(REQUEST_SLEEP)
-    concepts = _fetch_board_list(ak.stock_board_concept_name_em, "concept", errors)
-    log(f"概念板块 {len(concepts)} 个")
-    boards += concepts
+def get_all_boards(ak, errors, stats):
+    """拿到全市场 行业板块+概念板块 的当日快照。
+    先走东财直连（多镜像轮换），全挂了再退回akshare。"""
+    boards = []
+    for btype, ak_fn_name in [("industry", "stock_board_industry_name_em"),
+                              ("concept", "stock_board_concept_name_em")]:
+        got = []
+        # 通道1：东财直连
+        try:
+            got = get_boards_direct(btype)
+            stats["src"] = "东财直连"
+            log(f"{btype}板块(直连) {len(got)} 个")
+        except Exception as e:
+            log(f"{btype}板块直连失败: {e}")
+            errors.append(f"{btype}直连: {str(e)[:100]}")
+            # 通道2：akshare兜底（用到时才去取函数）
+            ak_fn = getattr(ak, ak_fn_name, None)
+            if ak_fn is not None:
+                got = _fetch_board_list(ak_fn, btype, errors)
+                if got:
+                    stats["src"] = "akshare兜底"
+                    log(f"{btype}板块(akshare兜底) {len(got)} 个")
+        boards += got
+        time.sleep(REQUEST_SLEEP)
 
     # 过滤黑名单
     boards = [b for b in boards
@@ -117,8 +238,17 @@ def get_all_boards(ak, errors):
     return boards
 
 
-def get_board_hist(ak, name, btype, start, end):
-    """拿板块的日K历史，行业和概念的接口参数不太一样，都试一遍"""
+def get_board_hist(ak, board, start, end):
+    """拿板块的日K历史：有板块代码就直连，没有就走akshare"""
+    # 通道1：直连（板块secid是 90.BKxxxx）
+    code = board.get("code")
+    if code:
+        try:
+            return get_kline_direct(f"90.{code}", lmt=LOOKBACK_DAYS + 20)
+        except Exception:
+            pass
+    # 通道2：akshare按板块名查
+    name, btype = board["name"], board["type"]
     if btype == "industry":
         attempts = [
             dict(symbol=name, start_date=start, end_date=end, period="日k", adjust=""),
@@ -163,10 +293,11 @@ def scan_boards(ak):
     """题材雷达主流程：粗筛 -> 拉历史 -> 精筛 -> 打分排序
     返回 (命中板块列表, 诊断统计)"""
     errors = []
-    boards = get_all_boards(ak, errors)
-    stats = {"total": len(boards), "checked": 0, "fetch_fail": 0,
+    stats = {"total": 0, "checked": 0, "fetch_fail": 0,
              "pos_low": 0, "pos_high": 0, "vol_low": 0, "hit": 0,
-             "errors": errors}
+             "errors": errors, "src": "未知"}
+    boards = get_all_boards(ak, errors, stats)
+    stats["total"] = len(boards)
     if not boards:
         return [], stats
 
@@ -186,7 +317,7 @@ def scan_boards(ak):
     results = []
     for b in candidates:
         time.sleep(REQUEST_SLEEP)
-        df = get_board_hist(ak, b["name"], b["type"], start, end)
+        df = get_board_hist(ak, b, start, end)
         if df is None:
             stats["fetch_fail"] += 1
             continue
@@ -338,45 +469,59 @@ def score_stock(df):
 
 def screen_board_stocks(ak, board):
     """筛一个板块里的个股"""
-    cons = get_constituents(ak, board["name"], board["type"])
-    if cons is None or len(cons) == 0:
-        return []
+    # 拿成分股：通道1直连（自带按成交额排序），通道2 akshare
+    stocks_list = []
+    code = board.get("code")
+    if code:
+        try:
+            stocks_list = get_constituents_direct(code, STOCKS_PER_BOARD * 2)
+        except Exception as e:
+            log(f"成分股直连失败 {board['name']}: {e}")
+    if not stocks_list:
+        cons = get_constituents(ak, board["name"], board["type"])
+        if cons is None or len(cons) == 0:
+            return []
+        if "成交额" in cons.columns:
+            cons["成交额"] = pd.to_numeric(cons["成交额"], errors="coerce")
+            cons = cons.sort_values("成交额", ascending=False)
+        for _, row in cons.iterrows():
+            try:
+                price = float(row.get("最新价", 0) or 0)
+            except Exception:
+                price = 0.0
+            stocks_list.append({"code": str(row["代码"]).zfill(6),
+                                "name": str(row["名称"]), "price": price})
 
     # 排雷：ST、退市、新股、低价股不要
-    def bad(row):
-        name = str(row.get("名称", ""))
-        try:
-            price = float(row.get("最新价", 0) or 0)
-        except Exception:
-            price = 0
-        return ("ST" in name or "退" in name or name.startswith(("N", "C"))
-                or price < 2)
-
-    cons = cons[~cons.apply(bad, axis=1)].copy()
-    # 按成交额排序，优先看资金活跃的
-    if "成交额" in cons.columns:
-        cons["成交额"] = pd.to_numeric(cons["成交额"], errors="coerce")
-        cons = cons.sort_values("成交额", ascending=False)
-    cons = cons.head(STOCKS_PER_BOARD)
+    stocks_list = [s for s in stocks_list
+                   if not ("ST" in s["name"] or "退" in s["name"]
+                           or s["name"].startswith(("N", "C"))
+                           or s["price"] < 2)]
+    stocks_list = stocks_list[:STOCKS_PER_BOARD]
 
     end = datetime.now().strftime("%Y%m%d")
     start = (datetime.now() - timedelta(days=150)).strftime("%Y%m%d")
 
     picks = []
-    for _, row in cons.iterrows():
-        code = str(row["代码"]).zfill(6)
-        name = str(row["名称"])
+    for s in stocks_list:
         time.sleep(REQUEST_SLEEP)
+        df = None
+        # 通道1：直连个股K线
         try:
-            df = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                    start_date=start, end_date=end, adjust="qfq")
-            if df is None or len(df) < 40:
-                continue
-            r = score_stock(df)
-            if r and r["score"] >= STOCK_MIN_SCORE:
-                picks.append({"code": code, "name": name, **r})
+            df = get_kline_direct(stock_secid(s["code"]), lmt=100)
         except Exception:
+            # 通道2：akshare
+            try:
+                df = ak.stock_zh_a_hist(symbol=s["code"], period="daily",
+                                        start_date=start, end_date=end,
+                                        adjust="qfq")
+            except Exception:
+                continue
+        if df is None or len(df) < 40:
             continue
+        r = score_stock(df)
+        if r and r["score"] >= STOCK_MIN_SCORE:
+            picks.append({"code": s["code"], "name": s["name"], **r})
 
     picks.sort(key=lambda x: x["score"], reverse=True)
     return picks[:TOP_STOCKS_PER_BOARD]
@@ -494,7 +639,8 @@ def build_report(boards_result, stats):
 
     # 诊断信息：让每次运行都能自我解释，出问题好排查
     lines.append(
-        f"📋 扫描明细：细查{stats.get('checked', 0)}个板块 | "
+        f"📋 扫描明细：数据通道[{stats.get('src', '未知')}] | "
+        f"细查{stats.get('checked', 0)}个板块 | "
         f"命中{stats.get('hit', 0)} | 还在低位没启动{stats.get('pos_low', 0)} | "
         f"涨幅已超35%剔除{stats.get('pos_high', 0)} | "
         f"量能不足{stats.get('vol_low', 0)} | 取数失败{stats.get('fetch_fail', 0)}")
